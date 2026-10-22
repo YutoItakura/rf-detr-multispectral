@@ -413,6 +413,42 @@ def _normalize_albu_params(name: str, params: dict[str, Any], aug_cls: type) -> 
     return normalized_params
 
 
+def _image_to_hwc_numpy(image: Any) -> tuple[np.ndarray, bool]:
+    """Convert PIL.Image or torch.Tensor or np.ndarray to (H, W, C) numpy array.
+
+    Returns (numpy_array, is_tensor).
+    """
+    if isinstance(image, torch.Tensor):
+        t = image.detach().cpu()
+        if t.ndim == 3:
+            # (C, H, W) -> (H, W, C)
+            arr = t.permute(1, 2, 0).numpy()
+        elif t.ndim == 2:
+            arr = t.numpy()
+        else:
+            arr = t.numpy()
+        return arr, True
+    elif isinstance(image, np.ndarray):
+        return image, False
+    else:
+        # PIL.Image
+        return np.array(image), False
+
+
+def _hwc_numpy_to_image(arr: np.ndarray, is_tensor: bool = False) -> Any:
+    """Convert (H, W, C) or (H, W) numpy array back to Tensor or PIL.Image.
+
+    If is_tensor is True or channels != 1 and channels != 3, returns Tensor(C, H, W).
+    Otherwise returns PIL.Image.
+    """
+    if is_tensor or (arr.ndim == 3 and arr.shape[2] not in (1, 3)):
+        if arr.ndim == 3:
+            return torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1)
+        elif arr.ndim == 2:
+            return torch.from_numpy(np.ascontiguousarray(arr))
+    return Image.fromarray(arr)
+
+
 class AlbumentationsWrapper:
     """Wrapper to apply Albumentations transforms to (image, target) tuples.
 
@@ -874,29 +910,12 @@ class AlbumentationsWrapper:
         return result
 
     def _apply_geometric_transform(
-        self, image_np: NDArray[np.uint8], target: dict[str, Any], labels: list[int]
-    ) -> tuple[Image.Image, dict[str, Any]]:
+        self, image_np: NDArray[np.uint8], target: dict[str, Any], labels: list[int], is_tensor: bool = False
+    ) -> tuple[Any, dict[str, Any]]:
         """Apply geometric transform to image with boxes and optionally masks.
 
         Converts data to Albumentations format, applies the transform, and converts back to RF-DETR format. Handles box
         removal and per-instance field filtering.
-
-        Args:
-            image_np: Numpy array of image in HWC format.
-            target: Target dictionary with 'boxes' and optionally 'masks'.
-            labels: List of category labels.
-
-        Returns:
-            Tuple of (transformed PIL Image, transformed target dict).
-
-        >>> import torch
-        >>> from albumentations import HorizontalFlip
-        >>> wrapper = AlbumentationsWrapper(HorizontalFlip(p=1.0))
-        >>> img = np.ones((100, 100, 3), dtype=np.uint8)
-        >>> tgt = {"boxes": torch.tensor([[10, 20, 30, 40]]), "labels": torch.tensor([1])}
-        >>> img_out, tgt_out = wrapper._apply_geometric_transform(img, tgt, [1])
-        >>> tgt_out["boxes"].shape
-        torch.Size([1, 4])
         """
         boxes_np = self._boxes_to_numpy(target["boxes"])
         num_boxes = boxes_np.shape[0]
@@ -960,8 +979,18 @@ class AlbumentationsWrapper:
                 aug_height, aug_width = augmented["image"].shape[:2]
                 target_out["masks"] = torch.zeros((0, aug_height, aug_width), dtype=torch.bool)
         else:
-            target_out["boxes"] = torch.as_tensor(bboxes_aug, dtype=torch.float32).reshape(-1, 4)
-            target_out["labels"] = torch.tensor(augmented["category_ids"], dtype=torch.long)
+            boxes_t = torch.as_tensor(bboxes_aug, dtype=torch.float32).reshape(-1, 4)
+            # [MSDet] 変換後に退化したボックス (幅/高さ < 1px) を安全にフィルタリング
+            valid_post = (boxes_t[:, 2] - boxes_t[:, 0] >= 1.0) & (boxes_t[:, 3] - boxes_t[:, 1] >= 1.0)
+            if not valid_post.all():
+                valid_post_idx = valid_post.nonzero().flatten().tolist()
+                boxes_t = boxes_t[valid_post]
+                category_ids = [augmented["category_ids"][i] for i in valid_post_idx]
+                kept_idxs = [kept_idxs[i] for i in valid_post_idx]
+            else:
+                category_ids = augmented["category_ids"]
+            target_out["boxes"] = boxes_t
+            target_out["labels"] = torch.tensor(category_ids, dtype=torch.long)
             target_out.update(self._filter_per_instance_fields(target, num_boxes, kept_idxs))
             # Recompute area from the transformed box coordinates so it stays consistent with
             # the new image scale (e.g. after resize the original COCO area values are stale).
@@ -970,7 +999,8 @@ class AlbumentationsWrapper:
                 target_out["area"] = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
             if keypoints_np is not None:
                 target_out["keypoints"] = self._resolve_keypoint_swap(augmented, kept_idxs, keypoints_np)
-        image_out = Image.fromarray(augmented["image"])
+        # [MSDet TIFF] テンソルまたは3ch以外の画像は PIL に変換せず Tensor(C, H, W) で返す
+        image_out = _hwc_numpy_to_image(augmented["image"], is_tensor)
         if masks_list is not None and "masks" in augmented:
             height, width = augmented["image"].shape[:2]
             masks_aug = augmented["masks"]
@@ -1028,7 +1058,7 @@ class AlbumentationsWrapper:
         """
         # === Inference mode: no ground-truth annotations ===
         if target is None:
-            image_np = np.array(image)
+            image_np, is_tensor = _image_to_hwc_numpy(image)
             if self._is_geometric:
                 # Geometric A.Compose requires label_fields even when there are no boxes
                 augmented = self.transform(
@@ -1043,7 +1073,7 @@ class AlbumentationsWrapper:
                 )
             else:
                 augmented = self.transform(image=image_np)
-            return Image.fromarray(augmented["image"]), None
+            return _hwc_numpy_to_image(augmented["image"], is_tensor), None
 
         # === Input Validation ===
         if not isinstance(target, dict):
@@ -1052,8 +1082,8 @@ class AlbumentationsWrapper:
             raise KeyError("target must contain 'labels' key")
 
         # === Format Conversion: PyTorch/PIL → Albumentations ===
-        # Convert PIL Image to numpy array (HWC format expected by Albumentations)
-        image_np = np.array(image)
+        # Convert PIL Image or Tensor to numpy array (HWC format expected by Albumentations)
+        image_np, is_tensor = _image_to_hwc_numpy(image)
 
         # Convert labels tensor to Python list (required by Albumentations category_ids)
         labels = target["labels"].cpu().tolist() if torch.is_tensor(target["labels"]) else list(target["labels"])
@@ -1066,17 +1096,24 @@ class AlbumentationsWrapper:
             )
         if self._is_geometric and "boxes" in target:
             # Geometric path: transform image and boxes together
-            image_out, target_out = self._apply_geometric_transform(image_np, target, labels)
+            image_out, target_out = self._apply_geometric_transform(image_np, target, labels, is_tensor=is_tensor)
         else:
             # Non-geometric path: transform image only
             augmented = self.transform(image=image_np)
-            image_out = Image.fromarray(augmented["image"])
+            image_out = _hwc_numpy_to_image(augmented["image"], is_tensor)
             target_out = target.copy()
 
         # Ensure 'size' (if present) matches the transformed image size (h, w)
         if "size" in target_out:
-            # PIL.Image.size is (width, height); many detectors expect (height, width)
-            width, height = image_out.size
+            if hasattr(image_out, "size"):
+                # PIL.Image.size is (width, height); many detectors expect (height, width)
+                width, height = image_out.size
+            elif isinstance(image_out, torch.Tensor):
+                height, width = image_out.shape[-2:]
+            elif isinstance(image_out, np.ndarray):
+                height, width = image_out.shape[:2]
+            else:
+                height, width = target_out["size"].tolist()
             target_out["size"] = torch.as_tensor([height, width], dtype=torch.int64)
         return image_out, target_out
 
