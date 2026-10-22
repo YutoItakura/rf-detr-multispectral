@@ -2882,6 +2882,14 @@ class RFDETR:
 
         for img_input in images:
             img: Any = img_input
+            # [MSDet TIFF] マルチスペクトルモデルでは TIFF パスを RGB 変換せず全バンドで読み込む
+            if isinstance(img, (str, Path)) and self.model_config.num_channels != 3:
+                from rfdetr.datasets.multispectral import is_tiff, load_tiff_as_tensor
+
+                if is_tiff(img):
+                    img = load_tiff_as_tensor(img, expected_channels=self.model_config.num_channels)
+                    if img.dtype == torch.uint8:
+                        img = img.float().div_(255.0)
             if isinstance(img, str):
                 if urlparse(img).scheme in ("http", "https"):
                     resp = requests.get(img, timeout=30)

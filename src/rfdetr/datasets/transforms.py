@@ -54,6 +54,22 @@ class Normalize:
         std: tuple[float, ...] = (0.229, 0.224, 0.225),
     ) -> None:
         self._normalize = _TVNormalize(mean, std)
+        self._mean, self._std = tuple(mean), tuple(std)  # [MSDet TIFF]
+
+    def _normalize_any_channels(self, image: Tensor) -> Tensor:
+        """[MSDet TIFF] 3ch 以外の画像では mean/std をチャンネル数に合わせて拡張して正規化する."""
+        num_channels = image.shape[-3]
+        if num_channels == len(self._mean):
+            return self._normalize(image)
+        from torchvision.transforms.v2.functional import normalize
+
+        from rfdetr.datasets.multispectral import expand_to_channels
+
+        return normalize(
+            image,
+            expand_to_channels(self._mean, num_channels),
+            expand_to_channels(self._std, num_channels),
+        )
 
     def __call__(self, image: Tensor, target: dict[str, Any] | None = None) -> tuple[Tensor, dict[str, Any] | None]:
         """Normalize image and convert target coordinates to relative format.
@@ -83,7 +99,7 @@ class Normalize:
             >>> out_tgt is None
             True
         """
-        image = self._normalize(image)
+        image = self._normalize_any_channels(image)  # [MSDet TIFF] 元: self._normalize(image)
         if target is None:
             return image, None
         target = target.copy()

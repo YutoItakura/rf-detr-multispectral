@@ -24,13 +24,14 @@ from torchvision.datasets import VisionDataset
 from rfdetr.config import MultiScale
 from rfdetr.datasets._aug_utils import resolve_keypoint_flip_pairs
 from rfdetr.datasets._keypoint_schema import YoloKeypointSchema, infer_yolo_keypoint_schema
-from rfdetr.datasets._torchvision import Compose
+from rfdetr.datasets._torchvision import Compose, _image_size
 from rfdetr.datasets._yolo_yaml import _extract_yolo_class_names_from_data, _load_yaml_mapping
 from rfdetr.datasets.coco import (
     make_coco_transforms,
     make_coco_transforms_square_div_64,
 )
 from rfdetr.datasets.io_utils import decode_image
+from rfdetr.datasets.multispectral import is_tiff, load_tiff_as_tensor  # [MSDet TIFF]
 from rfdetr.datasets.kornia_transforms import is_gpu_postprocess, resolve_backend_for_build
 from rfdetr.utilities.logger import get_logger
 
@@ -158,15 +159,20 @@ class _LazyYoloSample:
 class _LazyYoloDetectionDataset:
     """Lazy YOLO dataset that defers dense mask rasterization until ``__getitem__``."""
 
-    def __init__(self, classes: list[str], samples: list[_LazyYoloSample]) -> None:
+    def __init__(self, classes: list[str], samples: list[_LazyYoloSample], num_channels: int | None = None) -> None:
         self.classes = classes
         self._samples = samples
+        self.num_channels = num_channels  # [MSDet TIFF] TIFF のチャンネル数チェック用
 
     def __len__(self) -> int:
         return len(self._samples)
 
-    def __getitem__(self, idx: int) -> tuple[str, NDArray[np.uint8], Detections]:
+    def __getitem__(self, idx: int) -> tuple[str, NDArray[np.uint8] | torch.Tensor, Detections]:
         sample = self._samples[idx]
+        # [MSDet TIFF] TIFF は RGB 変換せず, 全バンドを (C, H, W) テンソルで返す
+        if is_tiff(sample.image_path):
+            image = load_tiff_as_tensor(sample.image_path, expected_channels=self.num_channels)
+            return sample.image_path, image, sample.to_detections()
         try:
             rgb_image, _ = decode_image(Path(sample.image_path))
         except (FileNotFoundError, OSError, UnidentifiedImageError) as exc:
@@ -460,7 +466,9 @@ def _build_yolo_samples(
     return classes, samples
 
 
-def _build_lazy_yolo_detection_dataset(img_folder: str, lb_folder: str, data_file: str) -> _LazyYoloDetectionDataset:
+def _build_lazy_yolo_detection_dataset(
+    img_folder: str, lb_folder: str, data_file: str, num_channels: int | None = None
+) -> _LazyYoloDetectionDataset:
     """Build a YOLO detection dataset that stores bounding boxes lazily.
 
     Unlike :func:`_build_lazy_yolo_segmentation_dataset`, this function does not store polygon coordinates or dense
@@ -479,10 +487,12 @@ def _build_lazy_yolo_detection_dataset(img_folder: str, lb_folder: str, data_fil
         ``sv.Detections`` without mask information.
     """
     classes, samples = _build_yolo_samples(img_folder, lb_folder, data_file, include_polygons=False)
-    return _LazyYoloDetectionDataset(classes=classes, samples=samples)
+    return _LazyYoloDetectionDataset(classes=classes, samples=samples, num_channels=num_channels)
 
 
-def _build_lazy_yolo_segmentation_dataset(img_folder: str, lb_folder: str, data_file: str) -> _LazyYoloDetectionDataset:
+def _build_lazy_yolo_segmentation_dataset(
+    img_folder: str, lb_folder: str, data_file: str, num_channels: int | None = None
+) -> _LazyYoloDetectionDataset:
     """Build a YOLO dataset that stores polygons and rasterizes masks on demand.
 
     Args:
@@ -495,7 +505,7 @@ def _build_lazy_yolo_segmentation_dataset(img_folder: str, lb_folder: str, data_
         masks into dense boolean tensors.
     """
     classes, samples = _build_yolo_samples(img_folder, lb_folder, data_file, include_polygons=True)
-    return _LazyYoloDetectionDataset(classes=classes, samples=samples)
+    return _LazyYoloDetectionDataset(classes=classes, samples=samples, num_channels=num_channels)
 
 
 def _build_lazy_yolo_keypoint_dataset(
@@ -862,6 +872,13 @@ def _parse_yaml_split_dirs(
                 continue  # traversal detected or unresolvable; skip this candidate
             if split_labels.is_dir():
                 return (split_images, split_labels), base_notes
+            # [MSDet TIFF] images/<種類>/Train のように画像側にだけ中間フォルダがある構成に対応.
+            # labels/<種類>/Train が無ければ, 中間フォルダを前から削って labels/Train を探す.
+            rest = parts[idx + 1 :]
+            for skip in range(1, len(rest)):
+                shared_labels = Path(*parts[:idx], "labels", *rest[skip:])
+                if _within_root(shared_labels, root) and shared_labels.is_dir():
+                    return (split_images, shared_labels), base_notes
     sub_images = split_images / "images"
     sub_labels = split_images / "labels"
     if sub_images.is_dir() and sub_labels.is_dir():
@@ -1072,7 +1089,7 @@ class ConvertYolo:
         Returns:
             tuple of (image, target_dict)
         """
-        w, h = image.size
+        h, w = _image_size(image)  # [MSDet TIFF] PIL / テンソルの両方に対応 (元: w, h = image.size)
 
         image_id = target["image_id"]
         image_id = torch.tensor([image_id])
@@ -1163,6 +1180,7 @@ class YoloDetection(VisionDataset):  # type: ignore[misc]  # torchvision ships n
         include_masks: bool = False,
         include_keypoints: bool = False,
         num_keypoints_per_class: list[int] | None = None,
+        num_channels: int | None = None,  # [MSDet TIFF]
     ):
         if include_masks and include_keypoints:
             raise ValueError("YOLO segmentation masks and keypoints cannot be loaded at the same time.")
@@ -1196,9 +1214,9 @@ class YoloDetection(VisionDataset):  # type: ignore[misc]  # torchvision ships n
                 self.keypoint_schema,
             )
         elif include_masks:
-            self.sv_dataset = _build_lazy_yolo_segmentation_dataset(img_folder, lb_folder, data_file)
+            self.sv_dataset = _build_lazy_yolo_segmentation_dataset(img_folder, lb_folder, data_file, num_channels)
         else:
-            self.sv_dataset = _build_lazy_yolo_detection_dataset(img_folder, lb_folder, data_file)
+            self.sv_dataset = _build_lazy_yolo_detection_dataset(img_folder, lb_folder, data_file, num_channels)
 
         self.classes = self.sv_dataset.classes
         self.ids = list(range(len(self.sv_dataset)))
@@ -1213,7 +1231,8 @@ class YoloDetection(VisionDataset):  # type: ignore[misc]  # torchvision ships n
         image_id = self.ids[idx]
         image_path, rgb_image, detections = self.sv_dataset[idx]
 
-        img = Image.fromarray(rgb_image)
+        # [MSDet TIFF] TIFF は既に (C, H, W) テンソルなので PIL に戻さない
+        img = rgb_image if isinstance(rgb_image, torch.Tensor) else Image.fromarray(rgb_image)
 
         target: dict[str, Any] = {"image_id": image_id, "detections": detections}
         if self.include_keypoints:
@@ -1284,6 +1303,7 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
     scale_jitter = getattr(args, "scale_jitter", True)
     include_keypoints = getattr(args, "use_grouppose_keypoints", False)
     num_keypoints_per_class = getattr(args, "num_keypoints_per_class", [])
+    num_channels = getattr(args, "num_channels", None)  # [MSDet TIFF]
     keypoint_flip_pairs = resolve_keypoint_flip_pairs(args, include_keypoints=include_keypoints)
     resolved_augmentation_backend = resolve_backend_for_build(getattr(args, "augmentation_backend", "cpu"))
     gpu_postprocess = is_gpu_postprocess(resolved_augmentation_backend)
@@ -1315,6 +1335,7 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
             include_masks=include_masks,
             include_keypoints=include_keypoints,
             num_keypoints_per_class=num_keypoints_per_class,
+            num_channels=num_channels,  # [MSDet TIFF]
         )
     else:
         dataset = YoloDetection(
@@ -1337,5 +1358,6 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
             include_masks=include_masks,
             include_keypoints=include_keypoints,
             num_keypoints_per_class=num_keypoints_per_class,
+            num_channels=num_channels,  # [MSDet TIFF]
         )
     return dataset

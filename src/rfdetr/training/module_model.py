@@ -429,6 +429,12 @@ class RFDETRModelModule(LightningModule):
             # No-op when load_pretrain_weights already wrapped the encoder to load a LoRA checkpoint.
             apply_lora(self.model)
 
+        # [MSDet TIFF] 3ch 以外のモデル設定時にパッチ埋め込みを適応
+        if model_config.num_channels != 3:
+            from rfdetr.datasets.multispectral import adapt_patch_embeddings
+
+            adapt_patch_embeddings(self.model, model_config.num_channels)
+
         # Build criterion/postprocessors after potential num_classes alignment so
         # they are constructed with a config that matches the current model head.
         self.criterion, self.postprocess = build_criterion_from_config(self.model_config, self.train_config)

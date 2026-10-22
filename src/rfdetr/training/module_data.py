@@ -980,7 +980,15 @@ class RFDETRDataModule(LightningDataModule):
             # The padding mask must receive every geometric warp, even for detection-only batches.
             with_masks=True,
         )
-        self._kornia_normalize = build_normalize()
+        # [MSDet TIFF] mean/std をモデルのチャンネル数に合わせる (元: build_normalize())
+        from rfdetr.datasets.kornia_transforms import IMAGENET_MEAN, IMAGENET_STD
+        from rfdetr.datasets.multispectral import expand_to_channels
+
+        num_channels = getattr(self.model_config, "num_channels", 3)
+        self._kornia_normalize = build_normalize(
+            mean=tuple(expand_to_channels(IMAGENET_MEAN, num_channels)),
+            std=tuple(expand_to_channels(IMAGENET_STD, num_channels)),
+        )
         logger.info("Kornia augmentation pipeline built (resolved=%s)", resolved)
 
     def on_after_batch_transfer(self, batch: tuple[Any, Any], dataloader_idx: int) -> tuple[Any, Any]:
