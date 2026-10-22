@@ -1105,13 +1105,15 @@ class AlbumentationsWrapper:
 
         # Ensure 'size' (if present) matches the transformed image size (h, w)
         if "size" in target_out:
-            if hasattr(image_out, "size"):
+            if isinstance(image_out, torch.Tensor):
+                height, width = int(image_out.shape[-2]), int(image_out.shape[-1])
+            elif isinstance(image_out, Image.Image):
                 # PIL.Image.size is (width, height); many detectors expect (height, width)
                 width, height = image_out.size
-            elif isinstance(image_out, torch.Tensor):
-                height, width = image_out.shape[-2:]
             elif isinstance(image_out, np.ndarray):
-                height, width = image_out.shape[:2]
+                height, width = int(image_out.shape[0]), int(image_out.shape[1])
+            elif hasattr(image_out, "size") and not callable(image_out.size):
+                width, height = image_out.size
             else:
                 height, width = target_out["size"].tolist()
             target_out["size"] = torch.as_tensor([height, width], dtype=torch.int64)
