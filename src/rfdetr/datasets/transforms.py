@@ -918,7 +918,12 @@ class AlbumentationsWrapper:
         # the image boundary so that x_min == x_max (or y_min == y_max) after clipping.
         # Albumentations' check_bboxes would raise ValueError for these inputs.
         if num_boxes > 0:
-            valid_mask = (boxes_np[:, 2] > boxes_np[:, 0]) & (boxes_np[:, 3] > boxes_np[:, 1])
+            img_h, img_w = image_np.shape[:2]
+            # [MSDet] 画像サイズ内に確実にクランプ
+            boxes_np[:, [0, 2]] = np.clip(boxes_np[:, [0, 2]], 0.0, float(img_w))
+            boxes_np[:, [1, 3]] = np.clip(boxes_np[:, [1, 3]], 0.0, float(img_h))
+            # [MSDet] 幅・高さが 1px 以上 (正規化後も潰れない) ボックスのみ残す
+            valid_mask = (boxes_np[:, 2] - boxes_np[:, 0] >= 1.0) & (boxes_np[:, 3] - boxes_np[:, 1] >= 1.0)
             if not valid_mask.all():
                 valid_positions = np.where(valid_mask)[0].tolist()
                 boxes_np = boxes_np[valid_mask]

@@ -601,7 +601,7 @@ def crop(
             (orig_height, orig_width),
             lambda boxes: functional.crop(boxes, top=top, left=left, height=height, width=width),
         )
-        keep = (cropped[:, 2] > cropped[:, 0]) & (cropped[:, 3] > cropped[:, 1])
+        keep = (cropped[:, 2] - cropped[:, 0] >= 1.0) & (cropped[:, 3] - cropped[:, 1] >= 1.0)
         boxes = cropped[keep]
         target_out = _filter_per_instance_fields(target_out, keep, boxes)
     if "masks" in target_out:

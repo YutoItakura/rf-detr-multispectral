@@ -1107,7 +1107,8 @@ class ConvertYolo:
         boxes[:, 0::2].clamp_(min=0, max=w)
         boxes[:, 1::2].clamp_(min=0, max=h)
 
-        keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
+        # [MSDet] 微小ボックス・境界線上の退化ボックスを除外 (幅・高さが 1px 以上)
+        keep = (boxes[:, 2] - boxes[:, 0] >= 1.0) & (boxes[:, 3] - boxes[:, 1] >= 1.0)
         boxes = boxes[keep]
         classes = classes[keep]
 
