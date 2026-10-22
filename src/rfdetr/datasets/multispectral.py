@@ -44,6 +44,24 @@ def is_tiff(path: str | Path) -> bool:
 # ------------------------------------------------------------------------
 # 読み込み
 # ------------------------------------------------------------------------
+def _read_with_cv2(path: Path) -> np.ndarray | None:
+    """OpenCV で TIFF を ``(C, H, W)`` 配列として読む (imwritemulti と最も親和性が高い)."""
+    try:
+        import cv2
+
+        ok, frames = cv2.imreadmulti(str(path), flags=cv2.IMREAD_UNCHANGED)
+        if ok and len(frames) > 0:
+            if len(frames) == 1:
+                f = frames[0]
+                if f.ndim == 2:
+                    return f[np.newaxis]
+                return np.transpose(f, (2, 0, 1))
+            return np.stack(frames, axis=0)
+    except Exception:
+        pass
+    return None
+
+
 def _read_with_pillow(path: Path) -> np.ndarray:
     """Pillow で TIFF を ``(C, H, W)`` 配列として読む."""
     with Image.open(path) as image:
@@ -79,6 +97,8 @@ def _read_with_tifffile(path: Path) -> np.ndarray:
 def read_tiff_bands(path: str | Path) -> np.ndarray:
     """TIFF を ``(C, H, W)`` の numpy 配列として読み込む.
 
+    cv2.imreadmulti -> Pillow -> tifffile の順で試行し, 確実にデコードする.
+
     Args:
         path: TIFF ファイルのパス.
 
@@ -86,11 +106,16 @@ def read_tiff_bands(path: str | Path) -> np.ndarray:
         ``(C, H, W)`` 配列 (dtype はファイルのまま).
     """
     path = Path(path)
+    cv2_bands = _read_with_cv2(path)
+    if cv2_bands is not None:
+        return np.ascontiguousarray(cv2_bands)
+
     try:
         bands = _read_with_pillow(path)
     except (OSError, ValueError):
         bands = _read_with_tifffile(path)
     return np.ascontiguousarray(bands)
+
 
 
 def load_tiff_as_tensor(path: str | Path, expected_channels: int | None = None) -> torch.Tensor:
