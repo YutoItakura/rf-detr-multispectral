@@ -1516,7 +1516,11 @@ class COCOEvalCallback(Callback):
         # console as RichProgressBar would silently nest (Live._nested=True) and
         # delegate all refresh() calls to the progress-bar renderable, so metric
         # tables would never appear.  console.print() avoids that nesting issue.
-        _render_summary_tables(console, title_pfx, overall_rendered, per_class)
+        try:
+            _render_summary_tables(console, title_pfx, overall_rendered, per_class)
+        except UnicodeEncodeError:
+            pass  # Windows CP932 console fallback
+
 
     def _convert_preds(self, preds: list[dict[str, Tensor]]) -> list[dict[str, Tensor]]:
         """Normalise prediction dicts from ``PostProcess`` for torchmetrics.
